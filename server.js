@@ -34,9 +34,12 @@ app.use(
 
 /* ── Nodemailer transporter (configured by env vars) ── */
 const transporter = nodemailer.createTransport({
-  host:   process.env.SMTP_HOST,
-  port:   parseInt(process.env.SMTP_PORT || "587", 10),
-  secure: process.env.SMTP_SECURE === "true",   /* true for port 465 */
+  host:              process.env.SMTP_HOST,
+  port:              parseInt(process.env.SMTP_PORT || "587", 10),
+  secure:            process.env.SMTP_SECURE === "true",
+  connectionTimeout: 10000,   /* 10s to connect */
+  greetingTimeout:   10000,
+  socketTimeout:     15000,
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
@@ -77,7 +80,7 @@ app.post("/submit", async function (req, res) {
     });
     return res.json({ ok: true });
   } catch (err) {
-    console.error("Mail send error:", err.message);
+    console.error("Mail send error:", err.message, "| SMTP host:", process.env.SMTP_HOST, "| user:", process.env.SMTP_USER);
     return res.status(500).json({ ok: false, error: "Failed to send. Please email us directly." });
   }
 });
