@@ -1,12 +1,16 @@
 "use strict";
 require("dotenv").config();
 
-const express    = require("express");
-const nodemailer = require("nodemailer");
-const rateLimit  = require("express-rate-limit");
+const express        = require("express");
+const { Resend }     = require("resend");
+const rateLimit      = require("express-rate-limit");
 
-const app  = express();
-const PORT = process.env.PORT || 3000;
+const app    = express();
+const PORT   = process.env.PORT || 3000;
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+/* ── Trust Render's reverse proxy (fixes express-rate-limit X-Forwarded-For error) ── */
+app.set("trust proxy", 1);
 
 /* ── Body parsing ── */
 app.use(express.json({ limit: "32kb" }));
@@ -32,20 +36,6 @@ app.use(
   })
 );
 
-/* ── Nodemailer transporter (configured by env vars) ── */
-const transporter = nodemailer.createTransport({
-  host:              process.env.SMTP_HOST,
-  port:              parseInt(process.env.SMTP_PORT || "587", 10),
-  secure:            process.env.SMTP_SECURE === "true",
-  connectionTimeout: 10000,   /* 10s to connect */
-  greetingTimeout:   10000,
-  socketTimeout:     15000,
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
-
 /* ── POST /submit ── */
 app.post("/submit", async function (req, res) {
   const data = req.body;
@@ -70,17 +60,24 @@ app.post("/submit", async function (req, res) {
     .map(function ([k, v]) { return k + ": " + v; })
     .join("\n");
 
+  const fromEmail = process.env.FROM_EMAIL || "info@asvakas.com";
+
   try {
-    await transporter.sendMail({
-      from:    '"Asvakas Website" <' + process.env.SMTP_USER + ">",
-      to:      process.env.TO_EMAIL || "info@asvakas.com",
-      replyTo: email,
-      subject: "Project Inquiry \u2014 " + serviceType,
-      text:    lines,
+    const { error } = await resend.emails.send({
+      from:     "Asvakas Website <" + fromEmail + ">",
+      to:       [process.env.TO_EMAIL || "info@asvakas.com"],
+      reply_to: email,
+      subject:  "Project Inquiry \u2014 " + serviceType,
+      text:     lines,
     });
+
+    if (error) {
+      console.error("Resend error:", JSON.stringify(error));
+      return res.status(500).json({ ok: false, error: "Failed to send. Please email us directly." });
+    }
     return res.json({ ok: true });
   } catch (err) {
-    console.error("Mail send error:", err.message, "| SMTP host:", process.env.SMTP_HOST, "| user:", process.env.SMTP_USER);
+    console.error("Resend exception:", err.message);
     return res.status(500).json({ ok: false, error: "Failed to send. Please email us directly." });
   }
 });
