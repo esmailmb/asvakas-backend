@@ -55,30 +55,67 @@ app.post("/submit", async function (req, res) {
     return res.status(400).json({ ok: false, error: "Invalid email address." });
   }
 
-  /* Build email body */
+  // Build HTML table rows for all fields
+  function buildTableRows(obj) {
+    return Object.entries(obj)
+      .map(([k, v]) => `<tr><td style="font-weight:bold;padding:8px 0;width:40%;">${k}:</td><td style="padding:8px 0;">${v}</td></tr>`)
+      .join("");
+  }
+
   const serviceType = data["Service Type"] || "New Inquiry";
+  const fromEmail = process.env.FROM_EMAIL || "info@asvakas.com";
+  const toEmail   = process.env.TO_EMAIL   || "info@asvakas.com";
+
+  // HTML email for admin
+  const adminHtml = `
+    <div style="max-width:500px;margin:0 auto;padding:24px;border:1px solid #e0e0e0;border-radius:8px;font-family:sans-serif;background:#fafbfc;">
+      <h2 style="color:#1a237e;margin-bottom:16px;">New Project Inquiry</h2>
+      <table style="width:100%;border-collapse:collapse;">${buildTableRows(data)}</table>
+    </div>
+  `;
+  // Plain text fallback
   const lines = Object.entries(data)
     .map(function ([k, v]) { return k + ": " + v; })
     .join("\n");
 
-  const fromEmail = process.env.FROM_EMAIL || "info@asvakas.com";
+  // HTML email for user receipt
+  const userHtml = `
+    <div style="max-width:500px;margin:0 auto;padding:24px;border:1px solid #e0e0e0;border-radius:8px;font-family:sans-serif;background:#fafbfc;">
+      <h2 style="color:#1a237e;margin-bottom:16px;">Thank you for contacting Asvakas</h2>
+      <p>We have received your inquiry and will get back to you soon. Here is a summary of your request:</p>
+      <table style="width:100%;border-collapse:collapse;">${buildTableRows(data)}</table>
+      <p style="margin-top:16px;">If you have any questions, reply to this email or contact us at info@asvakas.com.</p>
+    </div>
+  `;
+
+  console.log("[submit] Sending email — from:", fromEmail, "to:", toEmail, "subject: Project Inquiry —", serviceType);
 
   try {
-    const { error } = await resend.emails.send({
+    // Send to admin
+    const { data: sendData, error } = await resend.emails.send({
       from:     "Asvakas Website <" + fromEmail + ">",
-      to:       [process.env.TO_EMAIL || "info@asvakas.com"],
+      to:       [toEmail],
       reply_to: email,
       subject:  "Project Inquiry \u2014 " + serviceType,
       text:     lines,
+      html:     adminHtml,
     });
-
     if (error) {
-      console.error("Resend error:", JSON.stringify(error));
+      console.error("[submit] Resend error (admin):", JSON.stringify(error));
       return res.status(500).json({ ok: false, error: "Failed to send. Please email us directly." });
     }
+    // Send receipt to user
+    await resend.emails.send({
+      from:     "Asvakas Website <" + fromEmail + ">",
+      to:       [email],
+      subject:  "We received your inquiry",
+      text:     lines,
+      html:     userHtml,
+    });
+    console.log("[submit] Emails sent successfully. Resend ID:", sendData && sendData.id);
     return res.json({ ok: true });
   } catch (err) {
-    console.error("Resend exception:", err.message);
+    console.error("[submit] Resend exception:", err.message);
     return res.status(500).json({ ok: false, error: "Failed to send. Please email us directly." });
   }
 });
