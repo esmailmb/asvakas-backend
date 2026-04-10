@@ -66,11 +66,17 @@ app.post("/submit", async function (req, res) {
   const fromEmail = process.env.FROM_EMAIL || "info@asvakas.com";
   const toEmail   = process.env.TO_EMAIL   || "info@asvakas.com";
 
-  // HTML email for admin
+  // HTML email for admin (styled like user receipt)
   const adminHtml = `
-    <div style="max-width:500px;margin:0 auto;padding:24px;border:1px solid #e0e0e0;border-radius:8px;font-family:sans-serif;background:#fafbfc;">
-      <h2 style="color:#1a237e;margin-bottom:16px;">New Project Inquiry</h2>
-      <table style="width:100%;border-collapse:collapse;">${buildTableRows(data)}</table>
+    <div style="max-width:600px;margin:0 auto;padding:32px 24px;border:1px solid #e0e0e0;border-radius:12px;font-family:'Segoe UI',Arial,sans-serif;background:#fafbfc;">
+      <h2 style="color:#1a237e;font-size:2rem;margin-bottom:18px;font-weight:700;">New Project Inquiry</h2>
+      <table style="width:100%;border-collapse:collapse;font-size:1.08rem;">
+        ${Object.entries(data).map(([k, v]) => `
+          <tr>
+            <td style="font-weight:bold;padding:8px 0 8px 0;width:38%;color:#222;vertical-align:top;">${k}:</td>
+            <td style="padding:8px 0 8px 0;color:#222;">${v}</td>
+          </tr>`).join('')}
+      </table>
     </div>
   `;
   // Plain text fallback
