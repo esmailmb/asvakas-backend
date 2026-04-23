@@ -1,13 +1,83 @@
 "use strict";
 require("dotenv").config();
 
+const crypto         = require("crypto");
 const express        = require("express");
 const { Resend }     = require("resend");
 const rateLimit      = require("express-rate-limit");
+const svgCaptcha     = require("svg-captcha");
 
 const app    = express();
 const PORT   = process.env.PORT || 3000;
-const resend = new Resend(process.env.RESEND_API_KEY);
+const resendApiKey = process.env.RESEND_API_KEY;
+const isLocalDevMock = process.env.LOCAL_DEV === "true";
+const resend = resendApiKey ? new Resend(resendApiKey) : null;
+const captchaSigningSecret = process.env.CAPTCHA_SECRET || resendApiKey || (isLocalDevMock ? "local-dev-captcha-secret" : null);
+const CAPTCHA_TTL_MS = Number(process.env.CAPTCHA_TTL_MS || 10 * 60 * 1000);
+const CAPTCHA_MIN_SOLVE_MS = Number(process.env.CAPTCHA_MIN_SOLVE_MS || 3000);
+
+function normalizeCaptchaAnswer(value) {
+  return String(value || "").trim().replace(/\s+/g, "").toLowerCase();
+}
+
+function safeCompareStrings(left, right) {
+  const leftBuffer = Buffer.from(String(left || ""), "utf8");
+  const rightBuffer = Buffer.from(String(right || ""), "utf8");
+  if (leftBuffer.length !== rightBuffer.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function createCaptchaToken(answer) {
+  const normalizedAnswer = normalizeCaptchaAnswer(answer);
+  const expiresAt = Date.now() + CAPTCHA_TTL_MS;
+  const nonce = crypto.randomBytes(12).toString("hex");
+  const signature = crypto
+    .createHmac("sha256", captchaSigningSecret)
+    .update(normalizedAnswer + "." + expiresAt + "." + nonce)
+    .digest("base64url");
+
+  return {
+    token: expiresAt + "." + nonce + "." + signature,
+    expiresAt,
+  };
+}
+
+function verifyCaptchaToken(token, answer) {
+  if (!captchaSigningSecret || !token) {
+    return false;
+  }
+
+  const parts = String(token).split(".");
+  if (parts.length !== 3) {
+    return false;
+  }
+
+  const expiresAt = Number(parts[0]);
+  const nonce = parts[1];
+  const providedSignature = parts[2];
+  const normalizedAnswer = normalizeCaptchaAnswer(answer);
+
+  if (!expiresAt || !nonce || !providedSignature || !normalizedAnswer || Date.now() > expiresAt) {
+    return false;
+  }
+
+  const expectedSignature = crypto
+    .createHmac("sha256", captchaSigningSecret)
+    .update(normalizedAnswer + "." + expiresAt + "." + nonce)
+    .digest("base64url");
+
+  return safeCompareStrings(providedSignature, expectedSignature);
+}
+
+function sanitizeSubmissionData(rawData) {
+  return Object.fromEntries(
+    Object.entries(rawData).filter(function ([key]) {
+      return !String(key).startsWith("_");
+    })
+  );
+}
 
 /* ── Trust Render's reverse proxy (fixes express-rate-limit X-Forwarded-For error) ── */
 app.set("trust proxy", 1);
@@ -37,22 +107,60 @@ app.use(
   })
 );
 
+/* ── GET /captcha-challenge ── */
+app.get("/captcha-challenge", function (_req, res) {
+  if (!captchaSigningSecret) {
+    return res.status(503).json({ ok: false, error: "Security check is unavailable right now." });
+  }
+
+  const captcha = svgCaptcha.create({
+    size: 5,
+    noise: 4,
+    color: true,
+    background: "#f6f8fb",
+    ignoreChars: "0Oo1Il",
+  });
+  const challenge = createCaptchaToken(captcha.text);
+
+  res.setHeader("Cache-Control", "no-store");
+  return res.json({ ok: true, svg: captcha.data, token: challenge.token, expiresAt: challenge.expiresAt });
+});
+
 /* ── POST /submit ── */
 app.post("/submit", async function (req, res) {
-  const data = req.body;
+  const rawData = req.body;
 
   /* Basic validation */
-  if (!data || typeof data !== "object") {
+  if (!rawData || typeof rawData !== "object") {
     return res.status(400).json({ ok: false, error: "Invalid request." });
   }
-  const fullName = (data["Full Name"] || "").trim();
-  const email    = (data["Email"]     || "").trim();
+  const honeypot = (rawData._companyWebsite || "").trim();
+  const formStartedAt = Number(rawData._formStartedAt || 0);
+  const captchaToken = rawData._captchaToken || "";
+  const captchaAnswer = rawData._captchaAnswer || "";
+
+  if (honeypot) {
+    return res.status(400).json({ ok: false, error: "Security check failed. Please reload the form and try again." });
+  }
+  if (!formStartedAt || Date.now() - formStartedAt < CAPTCHA_MIN_SOLVE_MS) {
+    return res.status(400).json({ ok: false, error: "Please take a moment to complete the security check and try again." });
+  }
+  if (!verifyCaptchaToken(captchaToken, captchaAnswer)) {
+    return res.status(400).json({ ok: false, error: "Security check failed. Please enter the code shown and try again." });
+  }
+
+  const data = sanitizeSubmissionData(rawData);
+  const fullName = (data["Full Name"] || [data["First Name"], data["Last Name"]].filter(Boolean).join(" ")).trim();
+  const email    = (data["Email"] || "").trim();
   if (!fullName || !email) {
     return res.status(400).json({ ok: false, error: "Name and email are required." });
   }
   /* Simple email format check */
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return res.status(400).json({ ok: false, error: "Invalid email address." });
+  }
+  if (!data["Full Name"]) {
+    data["Full Name"] = fullName;
   }
 
   // Build HTML table rows for all fields
@@ -65,6 +173,16 @@ app.post("/submit", async function (req, res) {
   const serviceType = data["Service Type"] || "New Inquiry";
   const fromEmail = process.env.FROM_EMAIL || "info@asvakas.com";
   const toEmail   = process.env.TO_EMAIL   || "info@asvakas.com";
+
+  if (isLocalDevMock && !resend) {
+    console.log("[submit] LOCAL_DEV mock submission:", JSON.stringify(data));
+    return res.json({ ok: true, mocked: true });
+  }
+
+  if (!resend) {
+    console.error("[submit] Missing RESEND_API_KEY. Email delivery is not configured.");
+    return res.status(500).json({ ok: false, error: "Email service is not configured. Please email us directly." });
+  }
 
   // HTML email for admin (styled like user receipt)
   const adminHtml = `
