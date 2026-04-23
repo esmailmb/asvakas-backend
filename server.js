@@ -15,6 +15,9 @@ const resend = resendApiKey ? new Resend(resendApiKey) : null;
 const captchaSigningSecret = process.env.CAPTCHA_SECRET || resendApiKey || (isLocalDevMock ? "local-dev-captcha-secret" : null);
 const CAPTCHA_TTL_MS = Number(process.env.CAPTCHA_TTL_MS || 10 * 60 * 1000);
 const CAPTCHA_MIN_SOLVE_MS = Number(process.env.CAPTCHA_MIN_SOLVE_MS || 3000);
+const recaptchaSiteKey = (process.env.RECAPTCHA_SITE_KEY || "").trim();
+const recaptchaSecretKey = (process.env.RECAPTCHA_SECRET_KEY || "").trim();
+const recaptchaEnabled = Boolean(recaptchaSiteKey && recaptchaSecretKey);
 
 function normalizeCaptchaAnswer(value) {
   return String(value || "").trim().replace(/\s+/g, "").toLowerCase();
@@ -71,6 +74,42 @@ function verifyCaptchaToken(token, answer) {
   return safeCompareStrings(providedSignature, expectedSignature);
 }
 
+function getRequestIp(req) {
+  const forwardedFor = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return forwardedFor || req.ip || req.socket.remoteAddress || "";
+}
+
+async function verifyRecaptchaToken(token, remoteIp) {
+  if (!recaptchaEnabled || !token) {
+    return false;
+  }
+
+  const payload = new URLSearchParams({
+    secret: recaptchaSecretKey,
+    response: String(token),
+  });
+  if (remoteIp) {
+    payload.set("remoteip", remoteIp);
+  }
+
+  try {
+    const response = await fetch("https://www.google.com/recaptcha/api/siteverify", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: payload.toString(),
+    });
+    if (!response.ok) {
+      return false;
+    }
+
+    const data = await response.json();
+    return Boolean(data.success);
+  } catch (error) {
+    console.error("[captcha] reCAPTCHA verification failed:", error);
+    return false;
+  }
+}
+
 function sanitizeSubmissionData(rawData) {
   return Object.fromEntries(
     Object.entries(rawData).filter(function ([key]) {
@@ -108,6 +147,19 @@ app.use(
 );
 
 /* ── GET /captcha-challenge ── */
+app.get("/captcha-config", function (_req, res) {
+  res.setHeader("Cache-Control", "no-store");
+
+  if (recaptchaEnabled) {
+    return res.json({ ok: true, provider: "recaptcha", siteKey: recaptchaSiteKey });
+  }
+  if (captchaSigningSecret) {
+    return res.json({ ok: true, provider: "image" });
+  }
+
+  return res.status(503).json({ ok: false, error: "Security check is unavailable right now." });
+});
+
 app.get("/captcha-challenge", function (_req, res) {
   if (!captchaSigningSecret) {
     return res.status(503).json({ ok: false, error: "Security check is unavailable right now." });
@@ -134,18 +186,24 @@ app.post("/submit", async function (req, res) {
   if (!rawData || typeof rawData !== "object") {
     return res.status(400).json({ ok: false, error: "Invalid request." });
   }
-  const honeypot = (rawData._companyWebsite || "").trim();
   const formStartedAt = Number(rawData._formStartedAt || 0);
   const captchaToken = rawData._captchaToken || "";
   const captchaAnswer = rawData._captchaAnswer || "";
+  const recaptchaToken = rawData._recaptchaToken || "";
 
-  if (honeypot) {
-    return res.status(400).json({ ok: false, error: "Security check failed. Please reload the form and try again." });
-  }
   if (!formStartedAt || Date.now() - formStartedAt < CAPTCHA_MIN_SOLVE_MS) {
     return res.status(400).json({ ok: false, error: "Please take a moment to complete the security check and try again." });
   }
-  if (!verifyCaptchaToken(captchaToken, captchaAnswer)) {
+
+  const passedImageCaptcha = verifyCaptchaToken(captchaToken, captchaAnswer);
+  const passedRecaptcha = recaptchaEnabled && recaptchaToken
+    ? await verifyRecaptchaToken(recaptchaToken, getRequestIp(req))
+    : false;
+
+  if (!passedImageCaptcha && !passedRecaptcha) {
+    if (recaptchaEnabled) {
+      return res.status(400).json({ ok: false, error: "Please complete the Google security check and try again." });
+    }
     return res.status(400).json({ ok: false, error: "Security check failed. Please enter the code shown and try again." });
   }
 
